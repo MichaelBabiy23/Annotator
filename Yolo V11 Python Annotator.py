@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene,
     QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QLabel,
     QProgressDialog, QDoubleSpinBox, QComboBox, QSpinBox, QMessageBox,
-    QDialog, QCheckBox, QGroupBox, QScrollArea
+    QDialog, QCheckBox, QGroupBox, QScrollArea, QSlider, QTableWidget,
+    QTableWidgetItem, QHeaderView
 )
 from PySide6.QtGui import QPixmap, QMouseEvent, QKeyEvent, QImage, QAction, QKeySequence
 from PySide6.QtCore import Qt, QRectF, QPointF, QThread, Signal, QEvent, QObject, QTimer
@@ -17,6 +18,11 @@ from ultralytics import YOLO
 from save_worker import SaveWorker
 import torch
 import shutil  # Added for file copying
+
+# For image similarity detection
+import numpy as np
+from PIL import Image
+import imagehash  # May need to be installed with pip
 
 
 # ─────────────────── threaded auto‑annotate worker ───────────────────
@@ -291,6 +297,67 @@ class ImageLoaderWorker(QThread):
             self.error.emit(str(e))
 
 
+# Add ImageSimilarityWorker class after other worker classes
+class ImageSimilarityWorker(QThread):
+    progress = Signal(int, int)  # current, total
+    result = Signal(list)  # list of duplicate pairs
+    finished_ok = Signal()
+    error = Signal(str)
+
+    def __init__(self, image_paths, threshold):
+        super().__init__()
+        self.image_paths = image_paths
+        self.threshold = threshold
+
+    def run(self):
+        try:
+            total = len(self.image_paths)
+            if total < 2:
+                self.finished_ok.emit()
+                return
+
+            # Dictionary to store image hashes
+            hashes = {}
+
+            # Compute hashes for all images
+            for i, img_path in enumerate(self.image_paths):
+                try:
+                    # Load image and compute hash
+                    img = Image.open(img_path)
+                    img_hash = imagehash.phash(img)
+                    hashes[img_path] = img_hash
+
+                    # Report progress
+                    self.progress.emit(i + 1, total)
+                except Exception as e:
+                    print(f"Error processing {img_path}: {str(e)}")
+
+            # Find similar images
+            duplicates = []
+            paths = list(hashes.keys())
+
+            for i in range(len(paths)):
+                for j in range(i + 1, len(paths)):
+                    path1, path2 = paths[i], paths[j]
+                    hash1, hash2 = hashes[path1], hashes[path2]
+
+                    # Calculate hash difference
+                    diff = hash1 - hash2
+
+                    # If difference is below threshold, consider as duplicate
+                    if diff < self.threshold:
+                        duplicates.append((path1, path2, diff))
+
+            # Emit results
+            self.result.emit(duplicates)
+            self.finished_ok.emit()
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Error: {str(e)}\n{traceback.format_exc()}"
+            self.error.emit(error_msg)
+
+
 # ─────────────────────────── Main annotator ──────────────────────────
 class Annotator(QMainWindow):
     DUP_TOL = 1.0  # pixel tolerance for "same" box
@@ -521,6 +588,12 @@ class Annotator(QMainWindow):
         sort_by_least.setToolTip("Sort images by least annotations first")
         sort_by_least.clicked.connect(lambda: self._sort_images("least_first"))
 
+        # Add button to remove duplicated images
+        remove_duplicates_btn = QPushButton("Remove Duplicate Images")
+        remove_duplicates_btn.setToolTip("Detect and remove similar images based on a threshold\n"
+                                         "Requires PIL, numpy, and imagehash packages")
+        remove_duplicates_btn.clicked.connect(self.remove_duplicate_images)
+
         # Add button to remove annotated images
         remove_annotated_btn = QPushButton("Remove & Save Annotated Images")
         remove_annotated_btn.setToolTip("Save annotated images and remove them from the current view")
@@ -529,6 +602,7 @@ class Annotator(QMainWindow):
         sort_layout.addWidget(sort_by_empty)
         sort_layout.addWidget(sort_by_most)
         sort_layout.addWidget(sort_by_least)
+        sort_layout.addWidget(remove_duplicates_btn)
         sort_layout.addWidget(remove_annotated_btn)
         sort_group.setLayout(sort_layout)
 
@@ -2221,6 +2295,298 @@ class Annotator(QMainWindow):
         # Make current working model visible
         if self.current_working_model_index >= 0 and self.current_working_model_index < len(self.model_names):
             self.model_status_list.scrollToItem(self.model_status_list.item(self.current_working_model_index))
+
+    # Add this method to the Annotator class
+    def remove_duplicate_images(self):
+        """Detect and remove duplicate images based on a similarity threshold."""
+        if not self.image_paths or len(self.image_paths) < 2:
+            QMessageBox.information(self, "Not Enough Images",
+                                    "Need at least 2 images to detect duplicates.")
+            return
+
+        # Check if required packages are installed
+        try:
+            import numpy as np
+            from PIL import Image
+            import imagehash
+        except ImportError as e:
+            missing_package = str(e).split("'")[1]
+            QMessageBox.warning(self, "Missing Package",
+                                f"Required package '{missing_package}' is not installed.\n\n"
+                                f"Please install it using:\n"
+                                f"pip install {missing_package}")
+            return
+
+        # Store current annotations
+        self._store_current_annotations()
+
+        # Create dialog for threshold selection
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Duplicate Detection Settings")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+
+        # Add threshold slider
+        layout.addWidget(QLabel("Similarity Threshold (lower = more strict):"))
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 20)  # 0-20 range for hash difference
+        slider.setValue(8)  # Default value
+        slider.setTickPosition(QSlider.TicksBelow)
+        slider.setTickInterval(1)
+
+        slider_label = QLabel(f"Current: {slider.value()}")
+        slider.valueChanged.connect(lambda v: slider_label.setText(f"Current: {v}"))
+
+        layout.addWidget(slider)
+        layout.addWidget(slider_label)
+        layout.addWidget(QLabel("Lower values mean images must be more similar to be considered duplicates.\n"
+                                "Higher values will detect more duplicates but may include false positives."))
+
+        # Add buttons
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        cancel_button = QPushButton("Cancel")
+        ok_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        # Show dialog
+        result = dialog.exec_()
+        if result != QDialog.Accepted:
+            return
+
+        threshold = slider.value()
+
+        # Create progress dialog
+        progress = QProgressDialog(
+            "Analyzing images for duplicates...", "Cancel", 0, len(self.image_paths), self)
+        progress.setWindowTitle("Finding Duplicates")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+
+        # Create worker
+        self.similarity_worker = ImageSimilarityWorker(self.image_paths, threshold)
+        self.similarity_worker.progress.connect(lambda d, t: progress.setValue(d))
+        self.similarity_worker.result.connect(self._show_duplicate_selection)
+        self.similarity_worker.error.connect(lambda e: self.statusBar().showMessage(f"Error: {e}"))
+        progress.canceled.connect(self.similarity_worker.terminate)
+
+        # Start worker
+        self.similarity_worker.start()
+
+    def _show_duplicate_selection(self, duplicates):
+        """Show dialog for selecting which duplicates to remove."""
+        if not duplicates:
+            QMessageBox.information(self, "No Duplicates Found",
+                                    "No duplicate images were found with the current threshold.")
+            return
+
+        # Create dialog for duplicate selection
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Found {len(duplicates)} Duplicate Pairs")
+        dialog.setMinimumWidth(800)
+        dialog.setMinimumHeight(600)
+        layout = QVBoxLayout(dialog)
+
+        # Add info label
+        layout.addWidget(QLabel(f"Found {len(duplicates)} duplicate image pairs. "
+                                f"Select which images to remove from each pair:"))
+
+        # Create table for duplicate selection
+        table = QTableWidget(len(duplicates), 5)
+        table.setHorizontalHeaderLabels(["Image 1", "Image 2", "Difference", "Remove 1", "Remove 2"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+
+        # Add image preview area
+        preview_layout = QHBoxLayout()
+        preview1 = QLabel("Image 1 Preview")
+        preview2 = QLabel("Image 2 Preview")
+        preview1.setAlignment(Qt.AlignCenter)
+        preview2.setAlignment(Qt.AlignCenter)
+        preview1.setMinimumHeight(200)
+        preview2.setMinimumHeight(200)
+        preview_layout.addWidget(preview1)
+        preview_layout.addWidget(preview2)
+
+        # Add duplicate pairs to table
+        for i, (path1, path2, diff) in enumerate(duplicates):
+            # First image
+            item1 = QTableWidgetItem(os.path.basename(path1))
+            item1.setData(Qt.UserRole, path1)
+            table.setItem(i, 0, item1)
+
+            # Second image
+            item2 = QTableWidgetItem(os.path.basename(path2))
+            item2.setData(Qt.UserRole, path2)
+            table.setItem(i, 1, item2)
+
+            # Difference
+            table.setItem(i, 2, QTableWidgetItem(str(diff)))
+
+            # Remove checkboxes
+            check1 = QTableWidgetItem()
+            check1.setCheckState(Qt.Unchecked)
+            table.setItem(i, 3, check1)
+
+            check2 = QTableWidgetItem()
+            check2.setCheckState(Qt.Unchecked)
+            table.setItem(i, 4, check2)
+
+        # Connect table selection to preview
+        def update_preview():
+            row = table.currentRow()
+            if row >= 0:
+                path1 = table.item(row, 0).data(Qt.UserRole)
+                path2 = table.item(row, 1).data(Qt.UserRole)
+
+                # Load and display images
+                pixmap1 = QPixmap(path1)
+                pixmap2 = QPixmap(path2)
+
+                # Scale down if needed
+                max_size = 200
+                if pixmap1.width() > max_size or pixmap1.height() > max_size:
+                    pixmap1 = pixmap1.scaled(max_size, max_size, Qt.KeepAspectRatio)
+
+                if pixmap2.width() > max_size or pixmap2.height() > max_size:
+                    pixmap2 = pixmap2.scaled(max_size, max_size, Qt.KeepAspectRatio)
+
+                preview1.setPixmap(pixmap1)
+                preview2.setPixmap(pixmap2)
+
+        table.currentCellChanged.connect(lambda: update_preview())
+
+        # Select first row by default to show first image pair
+        if table.rowCount() > 0:
+            table.selectRow(0)
+            update_preview()
+
+        layout.addWidget(table)
+        layout.addLayout(preview_layout)
+
+        # Add buttons
+        button_layout = QHBoxLayout()
+
+        select_first = QPushButton("Select All First Images")
+        select_first.clicked.connect(lambda: self._select_duplicate_column(table, 3, Qt.Checked))
+
+        select_second = QPushButton("Select All Second Images")
+        select_second.clicked.connect(lambda: self._select_duplicate_column(table, 4, Qt.Checked))
+
+        clear_selection = QPushButton("Clear Selection")
+        clear_selection.clicked.connect(lambda: self._clear_duplicate_selection(table))
+
+        ok_button = QPushButton("Remove Selected")
+        cancel_button = QPushButton("Cancel")
+
+        button_layout.addWidget(select_first)
+        button_layout.addWidget(select_second)
+        button_layout.addWidget(clear_selection)
+        button_layout.addStretch()
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+
+        layout.addLayout(button_layout)
+
+        ok_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+
+        # Show dialog
+        result = dialog.exec_()
+        if result != QDialog.Accepted:
+            return
+
+        # Process selected duplicates
+        to_remove = set()
+        for i in range(table.rowCount()):
+            # Check if first image is selected for removal
+            if table.item(i, 3).checkState() == Qt.Checked:
+                path = table.item(i, 0).data(Qt.UserRole)
+                to_remove.add(path)
+
+            # Check if second image is selected for removal
+            if table.item(i, 4).checkState() == Qt.Checked:
+                path = table.item(i, 1).data(Qt.UserRole)
+                to_remove.add(path)
+
+        if not to_remove:
+            QMessageBox.information(self, "No Images Selected",
+                                    "No images were selected for removal.")
+            return
+
+        # Confirm removal
+        confirm = QMessageBox.question(
+            self, "Confirm Removal",
+            f"Remove {len(to_remove)} duplicate images?",
+            QMessageBox.Yes | QMessageBox.No)
+
+        if confirm != QMessageBox.Yes:
+            return
+
+        # Remove duplicates
+        self._remove_duplicate_images(to_remove)
+
+    def _select_duplicate_column(self, table, column, state):
+        """Select all checkboxes in a column."""
+        for i in range(table.rowCount()):
+            table.item(i, column).setCheckState(state)
+
+    def _clear_duplicate_selection(self, table):
+        """Clear all selection checkboxes."""
+        for i in range(table.rowCount()):
+            table.item(i, 3).setCheckState(Qt.Unchecked)
+            table.item(i, 4).setCheckState(Qt.Unchecked)
+
+    def _remove_duplicate_images(self, paths_to_remove):
+        """Remove the selected duplicate images."""
+        if not paths_to_remove:
+            return
+
+        # Store the current image
+        current_path = self.image_path
+
+        # Create a list of kept images
+        kept_images = []
+        removed_count = 0
+
+        for path in self.image_paths:
+            if path in paths_to_remove:
+                # Remove from annotation store
+                if path in self.annotations_store:
+                    del self.annotations_store[path]
+                removed_count += 1
+            else:
+                kept_images.append(path)
+
+        # Update paths list
+        self.image_paths = kept_images
+
+        # Handle case when there are no more images
+        if not self.image_paths:
+            self.curr_index = -1
+            self.image_path = None
+            self.scene.clear()
+            self.annotations.clear()
+            self.list_widget.clear()
+            self.image_spin.setEnabled(False)
+            self.statusBar().showMessage(f"Removed {removed_count} duplicate images. No images remaining.")
+            return
+
+        # Try to find the previous current image in the new list
+        if current_path in self.image_paths:
+            self.curr_index = self.image_paths.index(current_path)
+        else:
+            # If removed, go to the first image
+            self.curr_index = 0
+
+        # Load current image
+        self.load_current_image()
+
+        # Show confirmation
+        self.statusBar().showMessage(f"Removed {removed_count} duplicate images.")
 
 
 # ────────────────────────── bootstrap ───────────────────────────────
